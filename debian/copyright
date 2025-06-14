@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: compsize
-Source: https://github.com/kilobyte/compsize
+Source: https://github.com/thesnallygaster/compsize
 
 
 Files: *
