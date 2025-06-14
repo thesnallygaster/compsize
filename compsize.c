@@ -14,7 +14,9 @@
 #include <linux/limits.h>
 #include <getopt.h>
 #include <signal.h>
-#include "radix-tree.h"
+#include <errno.h>
+#include <string.h>
+#include "bitmap.h"
 #include "endianness.h"
 
 #if defined(DEBUG)
@@ -48,8 +50,9 @@ struct workspace
         uint64_t uncomp_all;
         uint64_t refd_all;
         uint64_t nfiles;
-        uint64_t nextents, nrefs, ninline;
-        struct radix_tree_root seen_extents;
+        uint64_t nextents, nrefs, ninline, nfrag;
+        uint64_t fragend;
+        struct bitmap seen_extents;
 };
 
 static const char *comp_types[MAX_ENTRIES] = { "none", "zlib", "lzo", "zstd" };
@@ -76,20 +79,6 @@ static void sigusr1(int dummy)
     sig_stats = 1;
 }
 
-static uint64_t get_u64(const void *mem)
-{
-    typedef struct __attribute__((__packed__)) { uint64_t v; } u64_unal;
-    uint64_t bad_endian = ((u64_unal*)mem)->v;
-    return htole64(bad_endian);
-}
-
-static uint32_t get_u32(const void *mem)
-{
-    typedef struct __attribute__((__packed__)) { uint32_t v; } u32_unal;
-    uint32_t bad_endian = ((u32_unal*)mem)->v;
-    return htole32(bad_endian);
-}
-
 static void init_sv2_args(ino_t st_ino, struct btrfs_sv2_args *sv2_args)
 {
         sv2_args->key.tree_id = 0;
@@ -106,6 +95,11 @@ static void init_sv2_args(ino_t st_ino, struct btrfs_sv2_args *sv2_args)
         sv2_args->buf_size = sizeof(sv2_args->buf);
 }
 
+static inline int IS_ALIGNED(uintptr_t ptr, size_t align)
+{
+	return (ptr & (align - 1)) == 0;
+}
+
 static inline int is_hole(uint64_t disk_bytenr)
 {
     return disk_bytenr == 0;
@@ -118,12 +112,13 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
     uint64_t disk_num_bytes, ram_bytes, disk_bytenr, num_bytes;
     uint32_t inline_header_sz;
     unsigned  comp_type;
+    int rv;
 
     DPRINTF("len=%u\n", hlen);
 
     ei = (struct btrfs_file_extent_item *) bp;
 
-    ram_bytes = get_u64(&ei->ram_bytes);
+    ram_bytes = get_unaligned_le64(&ei->ram_bytes);
     comp_type = ei->compression;
 
     if (ei->type == BTRFS_FILE_EXTENT_INLINE)
@@ -141,6 +136,8 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
         ws->uncomp[comp_type] += ram_bytes;
         ws->refd[comp_type] += ram_bytes;
         ws->ninline++;
+        ws->nfrag++;
+        ws->fragend = -1;
         return;
     }
 
@@ -150,9 +147,9 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
     if (hlen != sizeof(*ei))
         die("%s: Regular extent's header not 53 bytes (%u) long?!?\n", filename, hlen);
 
-    disk_num_bytes = get_u64(&ei->disk_num_bytes);
-    disk_bytenr = get_u64(&ei->disk_bytenr);
-    num_bytes = get_u64(&ei->num_bytes);
+    disk_num_bytes = get_unaligned_le64(&ei->disk_num_bytes);
+    disk_bytenr = get_unaligned_le64(&ei->disk_bytenr);
+    num_bytes = get_unaligned_le64(&ei->num_bytes);
 
     if (is_hole(disk_bytenr))
         return;
@@ -163,17 +160,26 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
     if (!IS_ALIGNED(disk_bytenr, 1 << 12))
         die("%s: Extent not 4K-aligned at %"PRIu64"?!?\n", filename, disk_bytenr);
 
-    disk_bytenr >>= 12;
-    radix_tree_preload(GFP_KERNEL);
-    if (radix_tree_insert(&ws->seen_extents, disk_bytenr, (void *)disk_bytenr) == 0)
+    switch((rv = bitmap_mark(&ws->seen_extents, disk_bytenr >> 12)))
     {
+    case 0:
          ws->disk[comp_type] += disk_num_bytes;
          ws->uncomp[comp_type] += ram_bytes;
          ws->nextents++;
+         break;
+    case 1:
+         break;
+    default:
+         errno = -rv;
+         die("bitmak_mark: %m\n");
     }
-    radix_tree_preload_end();
+
     ws->refd[comp_type] += num_bytes;
     ws->nrefs++;
+
+    if (disk_bytenr != ws->fragend)
+        ws->nfrag++;
+    ws->fragend = disk_bytenr + disk_num_bytes;
 }
 
 static void do_file(int fd, ino_t st_ino, struct workspace *ws, const char *filename)
@@ -185,6 +191,7 @@ static void do_file(int fd, ino_t st_ino, struct workspace *ws, const char *file
 
     DPRINTF("inode = %" PRIu64"\n", st_ino);
     ws->nfiles++;
+    ws->fragend = -1;
 
     init_sv2_args(st_ino, &sv2_args);
 
@@ -204,10 +211,13 @@ again:
     for (; nr_items > 0; nr_items--, bp += hlen)
     {
         head = (struct btrfs_ioctl_search_header*)bp;
-        hlen = get_u32(&head->len);
+        hlen = get_unaligned_32(&head->len);
         DPRINTF("{ transid=%lu objectid=%lu offset=%lu type=%u len=%u }\n",
-                get_u64(&head->transid), get_u64(&head->objectid), get_u64(&head->offset),
-                get_u32(&head->type), hlen);
+		get_unaligned_64(&head->transid),
+		get_unaligned_64(&head->objectid),
+		get_unaligned_64(&head->offset),
+		get_unaligned_32(&head->type),
+		hlen);
         bp += sizeof(*head);
 
         parse_file_extent_item(bp, hlen, ws, filename);
@@ -220,7 +230,7 @@ again:
     if (sv2_args.key.nr_items > 512)
     {
         sv2_args.key.nr_items = -1;
-        sv2_args.key.min_offset = get_u64(&head->offset) + 1;
+        sv2_args.key.min_offset = get_unaligned_64(&head->offset) + 1;
         goto again;
     }
 }
@@ -406,9 +416,9 @@ static int print_stats(struct workspace *ws)
     }
 
     printf("Processed %"PRIu64" file%s, %"PRIu64" regular extents "
-           "(%"PRIu64" refs), %"PRIu64" inline.\n",
+           "(%"PRIu64" refs), %"PRIu64" inline, %"PRIu64" fragments.\n",
            ws->nfiles, ws->nfiles>1 ? "s" : "",
-           ws->nextents, ws->nrefs, ws->ninline);
+           ws->nextents, ws->nrefs, ws->ninline, ws->nfrag);
 
     print_table("Type", "Perc", "Disk Usage", "Uncompressed", "Referenced");
     percentage = ws->disk_all*100/ws->uncomp_all;
@@ -442,6 +452,7 @@ static int print_stats(struct workspace *ws)
 
 int main(int argc, char **argv)
 {
+    int rv;
     struct workspace *ws;
 
     ws = (struct workspace *) calloc(sizeof(*ws), 1);
@@ -454,8 +465,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    radix_tree_init();
-    INIT_RADIX_TREE(&ws->seen_extents, 0);
+    if((rv = bitmap_init(&ws->seen_extents))) {
+        errno = -rv;
+        die("bitmap_init: %m\n");
+    }
+
     signal(SIGUSR1, sigusr1);
 
     for (; argv[optind]; optind++)
@@ -463,6 +477,7 @@ int main(int argc, char **argv)
 
     int ret = print_stats(ws);
 
+    bitmap_destroy(&ws->seen_extents);
     free(ws);
 
     return ret;
