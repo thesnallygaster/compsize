@@ -1,3 +1,9 @@
+btrfs-compsize (1.6-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Damian Duży <dame@zakonfeniksa.org>  Sat, 14 Jun 2025 16:08:29 +0200
+
 btrfs-compsize (1.5-1) unstable; urgency=medium
 
   * New upstream release (with a massive speed increase!).
